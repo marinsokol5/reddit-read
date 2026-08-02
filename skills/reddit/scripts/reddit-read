@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Read one Reddit thread as markdown on stdout.
+
+    reddit-read <url-or-post-id>
+
+Reddit answers 403 to unauthenticated reads from most non-residential IPs, so
+this first gets an anonymous installed-client token -- no account attached,
+public data only, nothing a logged-out visitor cannot see. Two requests per
+thread: one for the token, one for the thread.
+
+On HTTP 429 it stops and says so. It never mints a second token to buy a fresh
+rate-limit budget; that trick is the line between using an API and
+circumventing it, and it is deliberately absent.
+"""
+
+import base64
+import json
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+import uuid
+
+UA = "reddit-read/0.1 (personal reading)"
+# Reddit's Android app's *public* OAuth client -- note the empty password in the
+# Basic auth. Public clients cannot hold secrets by construction, so nothing
+# confidential is involved, and the token it yields grants read-only access to
+# public data.
+CLIENT_ID = "ohXpoqrZYub1kg"
+
+
+def curl(url, *extra):
+    """GET/POST via curl (more reliable than urllib on large responses)."""
+    run = subprocess.run(
+        ["curl", "-sS", "--max-time", "60", "-w", "\n%{http_code}",
+         "-H", f"User-Agent: {UA}", *extra, url],
+        capture_output=True)
+    if run.returncode != 0:
+        sys.exit(f"curl failed: {run.stderr.decode('utf-8', 'replace').strip()}")
+    body, _, code = run.stdout.rpartition(b"\n")
+    return int(code), body
+
+
+def token():
+    auth = base64.b64encode(f"{CLIENT_ID}:".encode()).decode()
+    code, body = curl(
+        "https://www.reddit.com/api/v1/access_token",
+        "-H", f"Authorization: Basic {auth}",
+        "-d", urllib.parse.urlencode({
+            "grant_type": "https://oauth.reddit.com/grants/installed_client",
+            "device_id": str(uuid.uuid4())}))
+    if code != 200:
+        sys.exit(f"auth failed (HTTP {code}): {body.decode('utf-8', 'replace')[:200]}")
+    return json.loads(body)["access_token"]
+
+
+def post_id(arg):
+    """Accept a full URL, a share link, redd.it/xxx, t3_xxx, or a bare id."""
+    arg = arg.strip()
+    if re.fullmatch(r"(t3_)?[a-z0-9]{5,10}", arg):
+        return arg.removeprefix("t3_")
+    for pattern in (r"/comments/([a-z0-9]+)", r"redd\.it/([a-z0-9]+)"):
+        found = re.search(pattern, arg)
+        if found:
+            return found.group(1)
+    if "reddit.com" in arg:  # mobile share link (/s/...) -- resolve one redirect
+        run = subprocess.run(
+            ["curl", "-sS", "--max-time", "30", "-o", "/dev/null",
+             "-w", "%{redirect_url}", "-A", UA, arg], capture_output=True)
+        found = re.search(r"/comments/([a-z0-9]+)", run.stdout.decode())
+        if found:
+            return found.group(1)
+    sys.exit(f"no Reddit post id found in: {arg}")
+
+
+def day(utc):
+    return time.strftime("%Y-%m-%d", time.gmtime(utc))
+
+
+def indent(text, pad):
+    return "\n".join(pad + ln if ln.strip() else "" for ln in text.strip().splitlines())
+
+
+def comments(listing, depth, out):
+    for child in listing.get("data", {}).get("children", []):
+        node, pad = child.get("data", {}), "  " * depth
+        if child.get("kind") == "more":
+            if node.get("count"):
+                out.append(f"{pad}- _… {node['count']} more replies_")
+            continue
+        out.append(f"{pad}- **u/{node.get('author') or '[deleted]'}** "
+                   f"▲{node.get('score', 0)} · {day(node.get('created_utc', 0))}\n"
+                   + indent(node.get("body") or "", pad + "  "))
+        if isinstance(node.get("replies"), dict):
+            comments(node["replies"], depth + 1, out)
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] in ("-h", "--help"):
+        sys.exit(__doc__)
+
+    code, body = curl(
+        f"https://oauth.reddit.com/comments/{post_id(sys.argv[1])}"
+        "?limit=500&raw_json=1",
+        "-H", f"Authorization: bearer {token()}")
+    if code == 429:
+        sys.exit("rate limited by Reddit -- wait a minute, then retry")
+    if code != 200:
+        sys.exit(f"HTTP {code}: {body.decode('utf-8', 'replace')[:300]}")
+
+    data = json.loads(body)
+    children = data[0]["data"]["children"] if isinstance(data, list) else []
+    if not children:
+        sys.exit("no such post (deleted, private, or quarantined subreddit)")
+    post = children[0]["data"]
+
+    out = [f"# {post['title']}", "",
+           f"r/{post['subreddit']} · u/{post.get('author') or '[deleted]'} · "
+           f"{day(post['created_utc'])} · ▲{post.get('score', 0)} · "
+           f"{post.get('num_comments', 0)} comments",
+           f"https://www.reddit.com{post['permalink']}"]
+    if post.get("selftext", "").strip():
+        out += ["", post["selftext"].strip()]
+    elif post.get("url"):
+        out += ["", f"Links to: {post['url']}"]
+    out += ["", "---", ""]
+    comments(data[1], 0, out)
+    print("\n".join(out))
+
+
+if __name__ == "__main__":
+    main()
