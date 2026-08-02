@@ -1,9 +1,9 @@
 ---
-name: reddit
-description: Read a Reddit post and its full comment thread as markdown, from a URL or post id. Use whenever the user runs /reddit, pastes a reddit.com link, or asks you to read, summarize, or discuss a Reddit thread — fetching reddit.com directly is blocked, this is the way in.
+name: reddit-read
+description: Read a Reddit post and its full comment thread as markdown, from a URL or post id. Use whenever the user runs /reddit-read, pastes a reddit.com link, or asks you to read, summarize, or discuss a Reddit thread — fetching reddit.com directly is blocked, this is the way in.
 ---
 
-# reddit
+# reddit-read
 
 The bundled script `scripts/reddit-read` (beside this file) prints one thread —
 post plus its nested comments — as markdown on stdout.
