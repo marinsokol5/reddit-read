@@ -39,6 +39,10 @@ them at 40 per thread, and renders everything as markdown with the comment tree
 indented. Credit: [jampick/lurk#54](https://github.com/jampick/lurk/issues/54);
 background: [redlib-org/redlib#591](https://github.com/redlib-org/redlib/issues/591).
 
+If Reddit blocks that too, it falls back to the thread's RSS feed
+(`/comments/<id>/.rss`): up to ~500 comments in thread order, but flat, with no
+nesting and no scores. The output says when it did.
+
 On HTTP 429 it stops and tells you to wait. It never mints a second token to
 buy a fresh rate-limit budget.
 

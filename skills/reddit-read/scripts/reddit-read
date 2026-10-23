@@ -16,6 +16,9 @@ the same thing a logged-out browser tab loads. Workaround found in
 https://github.com/jampick/lurk/issues/54; background in
 https://github.com/redlib-org/redlib/issues/591. Expect it to break again.
 
+When either of those gets the block page, it falls back to the thread's RSS
+feed: up to ~500 comments in thread order, but flat -- no nesting, no scores.
+
 Requests are paced and capped (MAX_PAGES); a big thread prints what fit and
 says how much was left. On HTTP 429 it stops and says so. It never mints a
 second token to buy a fresh rate-limit budget; that trick is the line between
@@ -32,6 +35,7 @@ import sys
 import time
 import urllib.parse
 import uuid
+import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 
 UA = "reddit-read/0.2 (personal reading)"
@@ -56,14 +60,17 @@ def curl(url, *extra):
     return int(code), body
 
 
+class Blocked(Exception):
+    """Reddit's edge served its "blocked by network security" page."""
+
+
 def check(code, body):
     if code == 429:
         sys.exit("rate limited by Reddit -- wait a minute, then retry")
     if code != 200:
         text = body.decode("utf-8", "replace")
         if "blocked by network security" in text:
-            sys.exit(f"HTTP {code}: blocked by Reddit's network security -- "
-                     "Reddit changed what it blocks again; this script needs updating")
+            raise Blocked(code)
         sys.exit(f"HTTP {code}: {text[:300]}")
     return body
 
@@ -149,7 +156,7 @@ class Comments(HTMLParser):
             name, a, parts = self.frames.pop()
             text = render(name, a, "".join(parts))
             if not self.frames:
-                self.body["body"] = re.sub(r"\n{3,}", "\n\n", text).strip()
+                self.body["body"] = re.sub(r"\n\s*\n", "\n\n", text).strip()
                 self.body = None
                 return
             self.frames[-1][2].append(text)
@@ -185,8 +192,19 @@ def render(tag, attrs, text):
     return text
 
 
+def markdown(fragment):
+    """A comment body's HTML as markdown, via the shreddit body reader."""
+    parser = Comments()
+    parser.feed(f'<shreddit-comment><div slot="comment">{fragment}</div>')
+    parser.close()
+    return parser.comments[0]["body"]
+
+
 def fetch_comments(sub, pid):
-    """All comments the page budget allows, plus how many stubs were left."""
+    """All comments the page budget allows, plus how many stubs were left.
+
+    A block on the first page raises Blocked; one on a later page keeps what
+    already arrived and counts the rest as left."""
     parser, seen, queue, pages = Comments(), set(), [], 0
 
     def take(code, body):
@@ -207,10 +225,50 @@ def fetch_comments(sub, pid):
     while queue and pages < MAX_PAGES:
         _, _, src, cursor = heapq.heappop(queue)
         time.sleep(PAUSE)
-        take(*curl(urllib.parse.urljoin("https://www.reddit.com", src),
-                   "--data-urlencode", f"cursor={cursor}"))
+        try:
+            take(*curl(urllib.parse.urljoin("https://www.reddit.com", src),
+                       "--data-urlencode", f"cursor={cursor}"))
+        except Blocked:
+            return parser.comments, len(queue) + 1
         pages += 1
     return parser.comments, len(queue)
+
+
+def rss(pid):
+    """The thread from its Atom feed: the post entry, then comments, flat."""
+    body = check(*curl(f"https://www.reddit.com/comments/{pid}/.rss?limit=500"))
+    atom = {"a": "http://www.w3.org/2005/Atom"}
+    root = ET.fromstring(body)
+    entries = root.findall("a:entry", atom)
+    if not entries:
+        sys.exit("no such post (deleted, private, or quarantined subreddit)")
+
+    def field(entry, path, default=""):
+        node = entry.find(path, atom)
+        return node.text or default if node is not None else default
+
+    post, replies = entries[0], entries[1:]
+    title = (root.findtext("a:title", "", atom)).rsplit(" : ", 1)
+    link = post.find("a:link", atom)
+    out = [f"# {title[0]}", "",
+           f"r/{title[-1]} · u/{field(post, 'a:author/a:name').removeprefix('/u/')}"
+           f" · {field(post, 'a:updated')[:10]} · {len(replies)} comments in feed",
+           link.get("href") if link is not None else ""]
+    # the post entry is its selftext (if any) plus a "submitted by … [link]" line
+    content = field(post, "a:content")
+    selftext = re.search(r'<div class="md">.*</div>', content, re.S)
+    url = re.search(r'<a href="([^"]+)">\[link\]</a>', content)
+    if selftext:
+        out += ["", markdown(selftext.group(0))]
+    elif url:
+        out += ["", f"Links to: {html.unescape(url.group(1))}"]
+    out += ["", "---", "", "_Comments from the RSS fallback (Reddit blocked the "
+            "usual route): thread order, but flat -- no nesting, no scores._", ""]
+    for entry in replies:
+        out.append(f"- **u/{field(entry, 'a:author/a:name', '[deleted]').removeprefix('/u/')}**"
+                   f" · {field(entry, 'a:updated')[:10]}\n"
+                   + indent(markdown(field(entry, "a:content")), "  "))
+    return out
 
 
 def day(utc):
@@ -247,6 +305,14 @@ def main():
         sys.exit(__doc__)
 
     pid = post_id(sys.argv[1])
+    try:
+        out = thread(pid)
+    except Blocked:
+        out = rss(pid)
+    print("\n".join(out))
+
+
+def thread(pid):
     body = check(*curl(f"https://oauth.reddit.com/by_id/t3_{pid}?raw_json=1",
                        "-H", f"Authorization: bearer {token()}"))
     children = json.loads(body).get("data", {}).get("children", [])
@@ -270,8 +336,8 @@ def main():
         tree(comments, out)
         if left:
             out += ["", f"_… {len(comments)} comments shown; {left} more-replies "
-                        f"stubs not fetched (page cap {MAX_PAGES})_"]
-    print("\n".join(out))
+                        f"stubs not fetched (page cap {MAX_PAGES} or a block)_"]
+    return out
 
 
 if __name__ == "__main__":
