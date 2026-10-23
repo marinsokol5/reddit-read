@@ -3,17 +3,28 @@
 
     reddit-read <url-or-post-id>
 
-Reddit answers 403 to unauthenticated reads from most non-residential IPs, so
-this first gets an anonymous installed-client token -- no account attached,
-public data only, nothing a logged-out visitor cannot see. Two requests per
-thread: one for the token, one for the thread.
+The post comes from the API: an anonymous installed-client token -- no account
+attached, public data only -- and GET /by_id/t3_<id>.
 
-On HTTP 429 it stops and says so. It never mints a second token to buy a fresh
-rate-limit budget; that trick is the line between using an API and
-circumventing it, and it is deliberately absent.
+The comments come from the web. Since 2026-10-20 Reddit's edge answers 403
+("blocked by network security") to logged-out API reads of comment trees: any
+/comments/ path on oauth.reddit.com or www, /api/morechildren, /api/info.
+Logged-out readers on reddit.com still see comments, and the page fetches them
+as HTML partials from /svc/shreddit/comments/..., 25 at a time, with
+"more replies" stubs that load by POSTing back a cursor. So this reads those,
+the same thing a logged-out browser tab loads. Workaround found in
+https://github.com/jampick/lurk/issues/54; background in
+https://github.com/redlib-org/redlib/issues/591. Expect it to break again.
+
+Requests are paced and capped (MAX_PAGES); a big thread prints what fit and
+says how much was left. On HTTP 429 it stops and says so. It never mints a
+second token to buy a fresh rate-limit budget; that trick is the line between
+using an API and circumventing it, and it is deliberately absent.
 """
 
 import base64
+import heapq
+import html
 import json
 import re
 import subprocess
@@ -21,13 +32,16 @@ import sys
 import time
 import urllib.parse
 import uuid
+from html.parser import HTMLParser
 
-UA = "reddit-read/0.1 (personal reading)"
+UA = "reddit-read/0.2 (personal reading)"
 # Reddit's Android app's *public* OAuth client -- note the empty password in the
 # Basic auth. Public clients cannot hold secrets by construction, so nothing
 # confidential is involved, and the token it yields grants read-only access to
-# public data.
+# public data. (The same client id Redlib uses.)
 CLIENT_ID = "ohXpoqrZYub1kg"
+MAX_PAGES = 40     # comment partials per thread, first page included
+PAUSE = 0.5        # seconds between comment partial requests
 
 
 def curl(url, *extra):
@@ -40,6 +54,18 @@ def curl(url, *extra):
         sys.exit(f"curl failed: {run.stderr.decode('utf-8', 'replace').strip()}")
     body, _, code = run.stdout.rpartition(b"\n")
     return int(code), body
+
+
+def check(code, body):
+    if code == 429:
+        sys.exit("rate limited by Reddit -- wait a minute, then retry")
+    if code != 200:
+        text = body.decode("utf-8", "replace")
+        if "blocked by network security" in text:
+            sys.exit(f"HTTP {code}: blocked by Reddit's network security -- "
+                     "Reddit changed what it blocks again; this script needs updating")
+        sys.exit(f"HTTP {code}: {text[:300]}")
+    return body
 
 
 def token():
@@ -74,6 +100,119 @@ def post_id(arg):
     sys.exit(f"no Reddit post id found in: {arg}")
 
 
+class Comments(HTMLParser):
+    """Collect <shreddit-comment>s (body as markdown) and more-comments stubs."""
+
+    INLINE = {"strong": "**", "b": "**", "em": "_", "i": "_", "del": "~~",
+              "s": "~~", "code": "`"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.comments, self.stubs = [], []
+        self.open_stubs = []     # more-comments <faceplate-partial>s still open
+        self.body = None         # comment whose body is being read
+        self.frames = []         # (tag, attrs, parts) inside that body
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "shreddit-comment":
+            self.comments.append({
+                "id": a.get("thingid"), "parent": a.get("parentid"),
+                "author": a.get("author") or "[deleted]",
+                "score": a.get("score", "?"), "day": (a.get("created") or "")[:10],
+                "body": ""})
+        elif tag == "faceplate-partial" and "more-comments" in (a.get("src") or ""):
+            stub = {"src": a["src"], "cursor": None}
+            self.open_stubs.append(stub)
+            self.stubs.append(stub)
+        elif tag == "faceplate-partial":
+            self.open_stubs.append(None)
+        elif tag == "input" and a.get("name") == "cursor" and self.open_stubs:
+            if self.open_stubs[-1] is not None:
+                self.open_stubs[-1]["cursor"] = a.get("value")
+        elif self.body is None and tag == "div" and a.get("slot") == "comment" \
+                and self.comments:
+            self.body = self.comments[-1]
+            self.frames = [("div", a, [])]
+        elif self.body is not None:
+            if tag == "br":
+                self.frames[-1][2].append("\n")
+            elif tag not in ("img", "hr", "input"):
+                self.frames.append((tag, a, []))
+
+    def handle_endtag(self, tag):
+        if tag == "faceplate-partial" and self.open_stubs:
+            self.open_stubs.pop()
+        if self.body is None or tag in ("br", "img", "hr", "input"):
+            return
+        while self.frames:
+            name, a, parts = self.frames.pop()
+            text = render(name, a, "".join(parts))
+            if not self.frames:
+                self.body["body"] = re.sub(r"\n{3,}", "\n\n", text).strip()
+                self.body = None
+                return
+            self.frames[-1][2].append(text)
+            if name == tag:
+                return
+
+    def handle_data(self, data):
+        if self.body is not None:
+            inside_pre = any(f[0] == "pre" for f in self.frames)
+            self.frames[-1][2].append(data if inside_pre else re.sub(r"\s+", " ", data))
+
+
+def render(tag, attrs, text):
+    """One closed HTML element of a comment body, as markdown."""
+    if tag in Comments.INLINE:
+        mark = Comments.INLINE[tag]
+        return f"{mark}{text.strip()}{mark}" if text.strip() else text
+    if tag == "a":
+        href = urllib.parse.urljoin("https://www.reddit.com", attrs.get("href") or "")
+        return f"[{text.strip()}]({href})" if text.strip() and href != text.strip() else href
+    if tag == "pre":
+        return f"\n\n```\n{text.strip(chr(10))}\n```\n\n"
+    if tag == "blockquote":
+        return "\n\n" + "\n".join("> " + ln for ln in text.strip().splitlines()) + "\n\n"
+    if tag == "li":
+        return "\n- " + text.strip()
+    if tag in ("p", "div", "ul", "ol", "table", "h1", "h2", "h3", "h4", "h5", "h6"):
+        return f"\n\n{text.strip()}\n\n"
+    if tag in ("tr",):
+        return "\n" + text.strip()
+    if tag in ("td", "th"):
+        return text.strip() + " | "
+    return text
+
+
+def fetch_comments(sub, pid):
+    """All comments the page budget allows, plus how many stubs were left."""
+    parser, seen, queue, pages = Comments(), set(), [], 0
+
+    def take(code, body):
+        check(code, body)
+        parser.stubs = []
+        parser.feed(body.decode("utf-8", "replace"))
+        for stub in parser.stubs:
+            src = html.unescape(stub["src"])
+            if stub["cursor"] and src not in seen:
+                seen.add(src)
+                depth = 0 if "top-level=1" in src else int(
+                    (re.search(r"startingDepth=(\d+)", src) or [0, 9])[1])
+                heapq.heappush(queue, (depth, len(seen), src, stub["cursor"]))
+
+    take(*curl(f"https://www.reddit.com/svc/shreddit/comments/r/{sub}/t3_{pid}"
+               "?render-mode=partial&sort=top"))
+    pages = 1
+    while queue and pages < MAX_PAGES:
+        _, _, src, cursor = heapq.heappop(queue)
+        time.sleep(PAUSE)
+        take(*curl(urllib.parse.urljoin("https://www.reddit.com", src),
+                   "--data-urlencode", f"cursor={cursor}"))
+        pages += 1
+    return parser.comments, len(queue)
+
+
 def day(utc):
     return time.strftime("%Y-%m-%d", time.gmtime(utc))
 
@@ -82,35 +221,35 @@ def indent(text, pad):
     return "\n".join(pad + ln if ln.strip() else "" for ln in text.strip().splitlines())
 
 
-def comments(listing, depth, out):
-    for child in listing.get("data", {}).get("children", []):
-        node, pad = child.get("data", {}), "  " * depth
-        if child.get("kind") == "more":
-            if node.get("count"):
-                out.append(f"{pad}- _… {node['count']} more replies_")
+def tree(comments, out):
+    kids, ids = {}, set()
+    for c in comments:
+        if c["id"] in ids:
             continue
-        out.append(f"{pad}- **u/{node.get('author') or '[deleted]'}** "
-                   f"▲{node.get('score', 0)} · {day(node.get('created_utc', 0))}\n"
-                   + indent(node.get("body") or "", pad + "  "))
-        if isinstance(node.get("replies"), dict):
-            comments(node["replies"], depth + 1, out)
+        ids.add(c["id"])
+        kids.setdefault(c["parent"], []).append(c)
+
+    def walk(parent, depth):
+        for c in kids.get(parent, []):
+            pad = "  " * depth
+            out.append(f"{pad}- **u/{c['author']}** ▲{c['score']} · {c['day']}\n"
+                       + indent(c["body"], pad + "  "))
+            walk(c["id"], depth + 1)
+
+    walk(None, 0)
+    # replies whose parent never arrived (should not happen) go at the end
+    for parent in kids.keys() - ids - {None}:
+        walk(parent, 0)
 
 
 def main():
     if len(sys.argv) != 2 or sys.argv[1] in ("-h", "--help"):
         sys.exit(__doc__)
 
-    code, body = curl(
-        f"https://oauth.reddit.com/comments/{post_id(sys.argv[1])}"
-        "?limit=500&raw_json=1",
-        "-H", f"Authorization: bearer {token()}")
-    if code == 429:
-        sys.exit("rate limited by Reddit -- wait a minute, then retry")
-    if code != 200:
-        sys.exit(f"HTTP {code}: {body.decode('utf-8', 'replace')[:300]}")
-
-    data = json.loads(body)
-    children = data[0]["data"]["children"] if isinstance(data, list) else []
+    pid = post_id(sys.argv[1])
+    body = check(*curl(f"https://oauth.reddit.com/by_id/t3_{pid}?raw_json=1",
+                       "-H", f"Authorization: bearer {token()}"))
+    children = json.loads(body).get("data", {}).get("children", [])
     if not children:
         sys.exit("no such post (deleted, private, or quarantined subreddit)")
     post = children[0]["data"]
@@ -125,7 +264,13 @@ def main():
     elif post.get("url"):
         out += ["", f"Links to: {post['url']}"]
     out += ["", "---", ""]
-    comments(data[1], 0, out)
+
+    if post.get("num_comments", 0):
+        comments, left = fetch_comments(post["subreddit"], pid)
+        tree(comments, out)
+        if left:
+            out += ["", f"_… {len(comments)} comments shown; {left} more-replies "
+                        f"stubs not fetched (page cap {MAX_PAGES})_"]
     print("\n".join(out))
 
 
